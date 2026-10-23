@@ -1,0 +1,181 @@
+name: Terraform
+
+# Runs fmt, init, validate and plan for dev and prod on every pull request that
+# touches the infrastructure, and shares the plan three ways:
+#   1. a sticky PR comment per environment (updated on each push)
+#   2. the workflow run summary
+#   3. a downloadable artifact (plan.txt)
+#
+# Modes:
+#   * plan-only (default): no AWS account needed. A local backend override and
+#     mock credentials (plan_only=true) let `plan -refresh=false` run offline.
+#   * aws: set the repository variable AWS_PLAN_ROLE_ARN to a read-only IAM
+#     role trusted for GitHub OIDC. The workflow then uses the real S3 backend
+#     and real credentials, and plans against live state.
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - "scripts/tf-check.sh"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write # post the plan as a PR comment
+  id-token: write      # GitHub OIDC -> AWS (only used in aws mode)
+
+concurrency:
+  group: terraform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "^1.10.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: ap-south-1
+  PLAN_MODE: ${{ vars.AWS_PLAN_ROLE_ARN != '' && 'aws' || 'plan-only' }}
+
+jobs:
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff infra
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    defaults:
+      run:
+        working-directory: infra/envs/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (aws mode)
+        if: env.PLAN_MODE == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Use a local backend (plan-only mode)
+        if: env.PLAN_MODE == 'plan-only'
+        run: |
+          cat > backend_override.tf <<'HCL'
+          terraform {
+            backend "local" {
+              path = ".plan-only/terraform.tfstate"
+            }
+          }
+          HCL
+
+      - name: terraform init
+        run: terraform init -no-color
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          if [ "${PLAN_MODE}" = "plan-only" ]; then
+            extra_args="-refresh=false -lock=false -var plan_only=true"
+          else
+            extra_args="-lock-timeout=5m"
+          fi
+          # shellcheck disable=SC2086
+          terraform plan -no-color ${extra_args} -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          summary="$(grep -E '^(Plan:|No changes\.)' plan.txt | head -n 1 || true)"
+          echo "summary=${summary:-See plan output}" >> "$GITHUB_OUTPUT"
+
+      - name: Add plan to the workflow summary
+        if: always() && steps.plan.outcome != 'skipped'
+        run: |
+          {
+            echo "## Terraform plan: \`${{ matrix.environment }}\` (${PLAN_MODE} mode)"
+            echo
+            echo "**${{ steps.plan.outputs.summary }}**"
+            echo
+            echo "<details><summary>Show full plan</summary>"
+            echo
+            echo '```hcl'
+            head -c 60000 plan.txt 2>/dev/null || echo "plan.txt not created (plan failed, see logs)"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ matrix.environment }}
+          path: infra/envs/${{ matrix.environment }}/plan.txt
+          retention-days: 14
+
+      - name: Comment plan on the pull request
+        if: github.event_name == 'pull_request' && steps.plan.outcome == 'success'
+        # PRs from forks get a read-only token; the summary and artifact still work.
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          SUMMARY: ${{ steps.plan.outputs.summary }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const marker = `<!-- terraform-plan:${env} -->`;
+            const limit = 60000; // GitHub comments max out at 65,536 characters
+            let plan = fs.readFileSync(`infra/envs/${env}/plan.txt`, 'utf8');
+            if (plan.length > limit) {
+              plan = plan.slice(0, limit) + '\n\n... truncated. Download the full plan from the workflow artifacts.';
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              `### Terraform plan: \`${env}\` (${process.env.PLAN_MODE} mode)`,
+              '',
+              `**${process.env.SUMMARY}**`,
+              '',
+              '<details><summary>Show full plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `fmt ✅ init ✅ validate ✅ plan ✅ · commit ${context.sha.slice(0, 7)} · [workflow run](${runUrl})`,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

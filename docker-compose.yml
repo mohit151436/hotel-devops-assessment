@@ -1,0 +1,33 @@
+# Local PostgreSQL for the database tasks.
+# First start: runs db/migrations/*.sql then db/seed/*.sql automatically.
+# Reset to a clean, re-seeded database: docker compose down -v && docker compose up -d
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-hotel}
+      POSTGRES_USER: ${DB_USER:-hotel_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hotel_local_only}
+      SEED_BOOKING_COUNT: ${SEED_BOOKING_COUNT:-50000}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/migrations:/db/migrations:ro
+      - ./db/seed:/db/seed:ro
+    healthcheck:
+      # TCP check (-h 127.0.0.1): during first-time init the server only listens
+      # on a Unix socket, so this stays unhealthy until the seed has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  db_data:

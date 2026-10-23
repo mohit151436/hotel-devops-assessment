@@ -1,0 +1,48 @@
+name: Database
+
+# Runs the same database checks the reviewers run, on a real Docker host:
+# docker compose up -> backup -> restore into a fresh DB -> verify -> EXPLAIN.
+
+on:
+  pull_request:
+    paths:
+      - "db/**"
+      - "scripts/**"
+      - "docker-compose.yml"
+      - ".github/workflows/database.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup-restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: shellcheck -x scripts/*.sh db/init/*.sh
+
+      - name: Start PostgreSQL (migrations + seed run on first start)
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: Backup
+        run: ./scripts/backup.sh
+
+      - name: Restore into a fresh database
+        run: ./scripts/restore.sh
+
+      - name: Verify restore
+        run: ./scripts/verify-restore.sh
+
+      - name: Show query plan with and without the index
+        run: ./scripts/explain-query.sh
+
+      - name: Container logs
+        if: failure()
+        run: docker compose logs db
+
+      - name: Clean up
+        if: always()
+        run: docker compose down -v
